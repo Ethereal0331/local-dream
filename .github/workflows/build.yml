@@ -125,6 +125,12 @@ jobs:
         uses: gradle/actions/setup-gradle@v4
         with:
           cache-read-only: ${{ github.ref != 'refs/heads/master' }}
+          # The vendored submodules (MNN, stable-diffusion.cpp, ...) ship their
+          # own sample projects with old gradle-wrapper.jar files that are not in
+          # Gradle's known-checksum list, so the default wrapper validation fails
+          # on a file we never use. Disable it; our own wrapper at
+          # gradle/wrapper/gradle-wrapper.jar is the one that actually runs.
+          validate-wrappers: false
 
       # ---------------------------------------------------------------------
       # Native core (optional)
