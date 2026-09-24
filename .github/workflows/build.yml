@@ -198,9 +198,13 @@ jobs:
         env:
           REAL_STORE_B64: ${{ secrets.RELEASE_STORE_B64 }}
         run: |
+          # app/build.gradle.kts resolves RELEASE_STORE_FILE with file(...),
+          # which is relative to the ':app' module directory, so pass an
+          # absolute path to avoid the "keystore not found" surprise.
+          KS_PATH="$GITHUB_WORKSPACE/keystore.jks"
           if [ -n "$REAL_STORE_B64" ]; then
             echo "Using provided release keystore."
-            echo "$REAL_STORE_B64" | base64 -d > keystore.jks
+            echo "$REAL_STORE_B64" | base64 -d > "$KS_PATH"
             {
               echo "STORE_PASS=${{ secrets.RELEASE_STORE_PASSWORD }}"
               echo "KEY_ALIAS=${{ secrets.RELEASE_KEY_ALIAS }}"
@@ -210,7 +214,7 @@ jobs:
           else
             echo "::warning::No signing keystore provided; generating a throwaway one."
             keytool -genkeypair -v \
-              -keystore keystore.jks \
+              -keystore "$KS_PATH" \
               -storetype JKS \
               -storepass android \
               -keypass android \
@@ -224,6 +228,8 @@ jobs:
               echo "IS_REAL=false"
             } >> "$GITHUB_ENV"
           fi
+          echo "KEYSTORE_PATH=$KS_PATH" >> "$GITHUB_ENV"
+          ls -la "$KS_PATH"
 
       - name: Build APK
         env:
@@ -234,7 +240,7 @@ jobs:
           # still produces an installable APK. Both use the same signingConfig,
           # which is why the throwaway keystore above is mandatory.
           if ./gradlew "assemble${VARIANT^}Release" \
-              -PRELEASE_STORE_FILE=keystore.jks \
+              -PRELEASE_STORE_FILE="$KEYSTORE_PATH" \
               -PRELEASE_STORE_PASSWORD="$STORE_PASS" \
               -PRELEASE_KEY_ALIAS="$KEY_ALIAS" \
               -PRELEASE_KEY_PASSWORD="$KEY_PASS" \
@@ -243,7 +249,7 @@ jobs:
           else
             echo "::warning::Release build failed; falling back to debug."
             ./gradlew "assemble${VARIANT^}Debug" \
-              -PRELEASE_STORE_FILE=keystore.jks \
+              -PRELEASE_STORE_FILE="$KEYSTORE_PATH" \
               -PRELEASE_STORE_PASSWORD="$STORE_PASS" \
               -PRELEASE_KEY_ALIAS="$KEY_ALIAS" \
               -PRELEASE_KEY_PASSWORD="$KEY_PASS" \
