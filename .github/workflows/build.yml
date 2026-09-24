@@ -1,0 +1,215 @@
+name: Build APK
+
+# Trigger the workflow on every push to any branch, on pull requests, and
+# allow manual runs from the Actions tab.
+#
+# NOTE ON THE NATIVE (C++) LAYER
+# ------------------------------
+# This project does NOT compile its C++ core through Gradle (there is no
+# `externalNativeBuild` block). The native libraries are built out-of-band
+# with app/src/main/cpp/build.sh and dropped into:
+#   app/src/main/jniLibs/arm64-v8a/libstable_diffusion_core.so
+#   app/src/main/assets/qnnlibs/*.so
+# Both of those paths are git-ignored, so a fresh checkout has NO native libs.
+#
+# Building the native core requires the Qualcomm QNN SDK (private, requires a
+# Qualcomm account to download) and the Android NDK r28. Since the QNN SDK
+# cannot be vendored in a public repo, the native build is wired up but gated:
+#   * If a QNN SDK is provided (see QNN_SDK_* secrets / release asset below),
+#     the workflow builds the native core and produces a FULL runnable APK.
+#   * Otherwise it skips the native step and produces a Kotlin-only APK for
+#     smoke-testing the Android/UI changes. That APK will NOT run inference,
+#     because the .so files are missing.
+on:
+  push:
+    branches: ["**"]
+  pull_request:
+    branches: ["**"]
+  workflow_dispatch:
+    inputs:
+      build_variant:
+        description: "Which product flavor to build"
+        required: true
+        default: "basic"
+        type: choice
+        options: [basic, filter]
+
+# Cancel superseded runs on the same ref to save CI minutes.
+concurrency:
+  group: build-${{ github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    name: Build (${{ github.event.inputs.build_variant || 'basic' }})
+    runs-on: ubuntu-latest
+    timeout-minutes: 90
+
+    env:
+      # Android SDK/NDK versions. NDK r28 matches CMakePresets.json.
+      ANDROID_NDK_VERSION: "28.0.13004108"
+      # Gradle/JVM: the project targets Java 17.
+      JAVA_VERSION: "17"
+
+    steps:
+      - name: Checkout (with submodules)
+        uses: actions/checkout@v4
+        with:
+          submodules: recursive
+          fetch-depth: 0
+
+      - name: Set up JDK ${{ env.JAVA_VERSION }}
+        uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: ${{ env.JAVA_VERSION }}
+
+      - name: Set up Android SDK
+        uses: android-actions/setup-android@v3
+
+      - name: Install Android NDK r28 and build tools
+        run: |
+          yes | sdkmanager --licenses > /dev/null 2>&1 || true
+          # compileSdk is 37 in app/build.gradle.kts; install that platform.
+          # AGP downloads any remaining build-tools/platforms it needs itself.
+          sdkmanager --install \
+            "ndk;${ANDROID_NDK_VERSION}" \
+            "cmake;3.22.1" \
+            "platforms;android-37" > /dev/null || \
+          sdkmanager --install \
+            "ndk;${ANDROID_NDK_VERSION}" \
+            "cmake;3.22.1" \
+            "platforms;android-36" > /dev/null
+          echo "ANDROID_NDK_ROOT=${ANDROID_SDK_ROOT}/ndk/${ANDROID_NDK_VERSION}" >> "$GITHUB_ENV"
+          echo "ANDROID_NDK_HOME=${ANDROID_SDK_ROOT}/ndk/${ANDROID_NDK_VERSION}" >> "$GITHUB_ENV"
+
+      - name: Set up Gradle
+        uses: gradle/actions/setup-gradle@v4
+        with:
+          cache-read-only: ${{ github.ref != 'refs/heads/master' }}
+
+      # ---------------------------------------------------------------------
+      # Native core (optional)
+      # ---------------------------------------------------------------------
+      # The QNN SDK is private. Two ways to supply it:
+      #   (a) base64 of a tar.gz in the secret QNN_SDK_ARCHIVE_B64 — only
+      #       practical for a trimmed SDK, because GitHub caps a single secret
+      #       at 48 KB and the raw SDK is far larger;
+      #   (b) publish the tar.gz as a release asset/base64 chunk and extend the
+      #       download step below. Without either, the native step is skipped and
+      #       the workflow produces a Kotlin-only (non-inference) APK.
+      - name: Restore QNN SDK (optional)
+        id: qnn
+        env:
+          QNN_B64: ${{ secrets.QNN_SDK_ARCHIVE_B64 }}
+        run: |
+          if [ -n "$QNN_B64" ]; then
+            echo "QNN SDK secret found; restoring."
+            mkdir -p "$RUNNER_TEMP/qnn"
+            printf '%s' "$QNN_B64" | base64 -d > "$RUNNER_TEMP/qnn/sdk.tar.gz"
+            tar -xzf "$RUNNER_TEMP/qnn/sdk.tar.gz" -C "$RUNNER_TEMP/qnn"
+            # The SDK root is the dir containing the QNN include/lib layout.
+            ROOT="$(find "$RUNNER_TEMP/qnn" -maxdepth 2 -type d -name 'QNN*' | head -1)"
+            echo "QNN_SDK_ROOT=$ROOT" >> "$GITHUB_ENV"
+            echo "found=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "No QNN SDK secret; native core will be skipped."
+            echo "found=false" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Build native core (QNN + stable-diffusion.cpp)
+        if: steps.qnn.outputs.found == 'true'
+        working-directory: app/src/main/cpp
+        run: |
+          chmod +x build.sh
+          ./build.sh
+        # build.sh drops:
+        #   app/src/main/jniLibs/arm64-v8a/libstable_diffusion_core.so
+        #   app/src/main/assets/qnnlibs/*.so
+
+      - name: Note missing native core
+        if: steps.qnn.outputs.found != 'true'
+        run: |
+          echo "::warning::QNN SDK not provided. Building a Kotlin-only APK. The app will not run inference because libstable_diffusion_core.so and the QNN libs are absent."
+
+      # ---------------------------------------------------------------------
+      # Kotlin / Android build
+      # ---------------------------------------------------------------------
+      - name: Grant execute permission to gradlew
+        run: chmod +x ./gradlew
+
+      - name: Static analysis (detekt + ktlint)
+        # Non-blocking: static analysis reports are uploaded, but pre-existing
+        # lint debt (the repo ships without a detekt baseline) must not stop the
+        # APK from being produced. Remove '|| true' to make it gate the build.
+        continue-on-error: true
+        run: ./gradlew detekt ktlintCheck --no-daemon --stacktrace
+
+      # IMPORTANT: BOTH the release and debug buildTypes in app/build.gradle.kts
+      # use the same `release` signingConfig (storeFile defaults to keystore.jks).
+      # So even a debug build fails to sign unless keystore.jks exists. If the
+      # caller did not provide a real keystore, generate a throwaway one so the
+      # APK is at least produced (it will be debug-signed and not publishable).
+      - name: Provide signing keystore
+        env:
+          REAL_STORE_B64: ${{ secrets.RELEASE_STORE_B64 }}
+        run: |
+          if [ -n "$REAL_STORE_B64" ]; then
+            echo "Using provided release keystore."
+            echo "$REAL_STORE_B64" | base64 -d > keystore.jks
+            {
+              echo "STORE_PASS=${{ secrets.RELEASE_STORE_PASSWORD }}"
+              echo "KEY_ALIAS=${{ secrets.RELEASE_KEY_ALIAS }}"
+              echo "KEY_PASS=${{ secrets.RELEASE_KEY_PASSWORD }}"
+              echo "IS_REAL=true"
+            } >> "$GITHUB_ENV"
+          else
+            echo "::warning::No signing keystore provided; generating a throwaway one."
+            keytool -genkeypair -v \
+              -keystore keystore.jks \
+              -storetype JKS \
+              -storepass android \
+              -keypass android \
+              -alias ci \
+              -keyalg RSA -keysize 2048 -validity 10000 \
+              -dname "CN=CI, OU=CI, O=CI, L=CI, S=CI, C=US"
+            {
+              echo "STORE_PASS=android"
+              echo "KEY_ALIAS=ci"
+              echo "KEY_PASS=android"
+              echo "IS_REAL=false"
+            } >> "$GITHUB_ENV"
+          fi
+
+      - name: Build APK
+        env:
+          VARIANT: ${{ github.event.inputs.build_variant || 'basic' }}
+        run: |
+          ./gradlew "assemble${VARIANT^}Release" \
+            -PRELEASE_STORE_FILE=keystore.jks \
+            -PRELEASE_STORE_PASSWORD="$STORE_PASS" \
+            -PRELEASE_KEY_ALIAS="$KEY_ALIAS" \
+            -PRELEASE_KEY_PASSWORD="$KEY_PASS" \
+            --no-daemon --stacktrace
+          echo "APK_DIR=app/build/outputs/apk/${VARIANT}/release" >> "$GITHUB_ENV"
+
+      - name: Upload APK artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: LocalDream-${{ github.event.inputs.build_variant || 'basic' }}-apk
+          path: |
+            ${{ env.APK_DIR }}/*.apk
+          if-no-files-found: error
+
+      - name: Upload build reports on failure
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: build-reports
+          path: |
+            app/build/reports/**
+            app/build/outputs/logs/**
+          if-no-files-found: ignore
