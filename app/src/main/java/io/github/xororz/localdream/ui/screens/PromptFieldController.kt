@@ -69,10 +69,13 @@ internal class PromptFieldController(
     val redoEnabled: Boolean get() = redoStack.isNotEmpty()
 
     var tokenCount by mutableIntStateOf(2)
-    var tokenMax by mutableIntStateOf(77)
+
+    // 0 renders as "count/∞": prompt length is unlimited, so there is no cap to
+    // display. Kept as a var because the tokenize effect still refreshes it.
+    var tokenMax by mutableIntStateOf(0)
 
     // UTF-16 index from which the text exceeds the token limit, or -1 when it
-    // fits. Drives the greyed-out overflow hint in the field.
+    // fits. Always -1 now (no limit), so nothing is ever greyed out.
     var overflowOffset by mutableIntStateOf(-1)
 
     private var suggestJob: Job? = null
@@ -236,8 +239,11 @@ internal fun PromptTokenCountEffect(
         delay(400)
         val result = tokenizePromptRequest(controller.text, backendHost) ?: return@LaunchedEffect
         controller.tokenCount = result.count
-        controller.tokenMax = result.maxLength
-        controller.overflowOffset = result.overflowOffset
+        // Prompt length is unlimited by design: ignore any cap the backend
+        // reports (0 = the "∞" convention) and never grey out trailing text.
+        // Enforcement, if any, is the backend's business at generation time.
+        controller.tokenMax = 0
+        controller.overflowOffset = -1
     }
 }
 

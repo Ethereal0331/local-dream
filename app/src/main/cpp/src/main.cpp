@@ -776,9 +776,15 @@ static void registerTokenizeEndpoint(httplib::Server &svr,
 
       TokenizeInfo info = text_encoder->tokenizeInfo(text, max_len);
 
+      // Prompt length is intentionally UNLIMITED: report the raw token count but
+      // never a cap or an overflow boundary, so the UI shows no "/max" limit and
+      // never greys out trailing text. max_length == 0 is the existing "∞"
+      // convention the MNN/DiT paths already use; overflow_offset == -1 means
+      // "nothing overflows". The prompt is still clipped internally to the
+      // model's context at generation time, but the user may type freely.
       nlohmann::json resp = {{"count", info.count},
-                             {"max_length", text_encoder->max_chunks_ == 0 ? 0 : max_len},
-                             {"overflow_offset", info.overflow_offset}};
+                             {"max_length", 0},
+                             {"overflow_offset", -1}};
       res.status = 200;
       res.set_content(resp.dump(), "application/json");
     } catch (const std::exception &e) {
