@@ -67,24 +67,59 @@ jobs:
           distribution: temurin
           java-version: ${{ env.JAVA_VERSION }}
 
-      - name: Set up Android SDK
-        uses: android-actions/setup-android@v3
-
-      - name: Install Android NDK r28 and build tools
+      # NOTE: we deliberately do NOT use android-actions/setup-android: it tries
+      # to install the legacy "tools" package, which newer sdkmanager releases
+      # have removed ("Failed to find package 'tools'"), and then crashes. The
+      # GitHub-hosted runner already ships a full Android SDK, so we just wire it
+      # into the environment and drive sdkmanager ourselves.
+      - name: Configure Android SDK
         run: |
-          yes | sdkmanager --licenses > /dev/null 2>&1 || true
-          # compileSdk is 37 in app/build.gradle.kts; install that platform.
-          # AGP downloads any remaining build-tools/platforms it needs itself.
-          sdkmanager --install \
+          SDK_ROOT="${ANDROID_SDK_ROOT:-${ANDROID_HOME:-/usr/local/lib/android/sdk}}"
+          echo "SDK root: $SDK_ROOT"
+          ls -la "$SDK_ROOT/cmdline-tools" || true
+
+          # Prefer versioned dirs (16.0, 12.0, ...) and fall back to 'latest'.
+          # -L follows the 'latest' symlink so find descends into it.
+          CMDLINE=""
+          for d in $(ls -1 "$SDK_ROOT/cmdline-tools" 2>/dev/null | sort -V -r); do
+            if [ -x "$SDK_ROOT/cmdline-tools/$d/bin/sdkmanager" ] || \
+               [ -f "$SDK_ROOT/cmdline-tools/$d/bin/sdkmanager" ]; then
+              CMDLINE="$SDK_ROOT/cmdline-tools/$d/bin/sdkmanager"
+              break
+            fi
+          done
+          if [ -z "$CMDLINE" ]; then
+            echo "::error::sdkmanager not found under $SDK_ROOT/cmdline-tools"
+            exit 1
+          fi
+          echo "Using sdkmanager: $CMDLINE"
+          {
+            echo "ANDROID_SDK_ROOT=$SDK_ROOT"
+            echo "ANDROID_HOME=$SDK_ROOT"
+            echo "SDKMANAGER=$CMDLINE"
+          } >> "$GITHUB_ENV"
+          echo "$(dirname "$CMDLINE")" >> "$GITHUB_PATH"
+          # Accept licenses non-interactively. Failure here is non-fatal: the
+          # runner image already has the common licenses accepted.
+          yes | "$CMDLINE" --licenses > /dev/null 2>&1 || true
+
+      - name: Install Android NDK r28, CMake and platform
+        run: |
+          # compileSdk is 37 in app/build.gradle.kts. Try 37 first (may not be
+          # published yet), then fall back to 36. AGP downloads whatever else it
+          # needs (build-tools etc.) by itself.
+          "$SDKMANAGER" --install \
             "ndk;${ANDROID_NDK_VERSION}" \
             "cmake;3.22.1" \
-            "platforms;android-37" > /dev/null || \
-          sdkmanager --install \
+            "platforms;android-37" > /dev/null 2>&1 || \
+          "$SDKMANAGER" --install \
             "ndk;${ANDROID_NDK_VERSION}" \
             "cmake;3.22.1" \
             "platforms;android-36" > /dev/null
           echo "ANDROID_NDK_ROOT=${ANDROID_SDK_ROOT}/ndk/${ANDROID_NDK_VERSION}" >> "$GITHUB_ENV"
           echo "ANDROID_NDK_HOME=${ANDROID_SDK_ROOT}/ndk/${ANDROID_NDK_VERSION}" >> "$GITHUB_ENV"
+          echo "NDK installed at: ${ANDROID_SDK_ROOT}/ndk/${ANDROID_NDK_VERSION}"
+          ls "${ANDROID_SDK_ROOT}/ndk" || true
 
       - name: Set up Gradle
         uses: gradle/actions/setup-gradle@v4
@@ -188,13 +223,27 @@ jobs:
         env:
           VARIANT: ${{ github.event.inputs.build_variant || 'basic' }}
         run: |
-          ./gradlew "assemble${VARIANT^}Release" \
-            -PRELEASE_STORE_FILE=keystore.jks \
-            -PRELEASE_STORE_PASSWORD="$STORE_PASS" \
-            -PRELEASE_KEY_ALIAS="$KEY_ALIAS" \
-            -PRELEASE_KEY_PASSWORD="$KEY_PASS" \
-            --no-daemon --stacktrace
-          echo "APK_DIR=app/build/outputs/apk/${VARIANT}/release" >> "$GITHUB_ENV"
+          # Try the release variant first (R8-minified, shrinkResources). If it
+          # fails for any reason, fall back to the debug variant so the workflow
+          # still produces an installable APK. Both use the same signingConfig,
+          # which is why the throwaway keystore above is mandatory.
+          if ./gradlew "assemble${VARIANT^}Release" \
+              -PRELEASE_STORE_FILE=keystore.jks \
+              -PRELEASE_STORE_PASSWORD="$STORE_PASS" \
+              -PRELEASE_KEY_ALIAS="$KEY_ALIAS" \
+              -PRELEASE_KEY_PASSWORD="$KEY_PASS" \
+              --no-daemon --stacktrace; then
+            echo "APK_DIR=app/build/outputs/apk/${VARIANT}/release" >> "$GITHUB_ENV"
+          else
+            echo "::warning::Release build failed; falling back to debug."
+            ./gradlew "assemble${VARIANT^}Debug" \
+              -PRELEASE_STORE_FILE=keystore.jks \
+              -PRELEASE_STORE_PASSWORD="$STORE_PASS" \
+              -PRELEASE_KEY_ALIAS="$KEY_ALIAS" \
+              -PRELEASE_KEY_PASSWORD="$KEY_PASS" \
+              --no-daemon --stacktrace
+            echo "APK_DIR=app/build/outputs/apk/${VARIANT}/debug" >> "$GITHUB_ENV"
+          fi
 
       - name: Upload APK artifacts
         uses: actions/upload-artifact@v4
